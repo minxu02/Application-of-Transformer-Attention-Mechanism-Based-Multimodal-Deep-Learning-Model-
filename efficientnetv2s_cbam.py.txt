@@ -1,0 +1,220 @@
+# efficientnetv2s_cbam.py
+# -*- coding: utf-8 -*-
+import os
+import torch
+import torch.nn as nn
+import timm
+from typing import Optional, Tuple
+
+# =============== 可选：safetensors 支持 ==================
+_HAS_SAFETENSORS = False
+try:
+    from safetensors.torch import load_file as _st_load_file
+    _HAS_SAFETENSORS = True
+except Exception:
+    pass
+
+# ==================== CBAM 模块 ====================
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=16):
+        super().__init__()
+        hidden = max(8, in_planes // ratio)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.mlp = nn.Sequential(
+            nn.Conv2d(in_planes, hidden, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, in_planes, 1, bias=False)
+        )
+        self.sigmoid = nn.Sigmoid()
+    def forward(self, x):
+        return self.sigmoid(self.mlp(self.avg_pool(x)) + self.mlp(self.max_pool(x)))
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        padding = (kernel_size - 1) // 2
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        return self.sigmoid(self.conv(x))
+
+class CBAM(nn.Module):
+    def __init__(self, channels, ratio=8, sa_kernel=7):
+        super().__init__()
+        self.ca = ChannelAttention(channels, ratio=ratio)
+        self.sa = SpatialAttention(kernel_size=sa_kernel)
+    def forward(self, x):
+        x = x * self.ca(x)
+        x = x * self.sa(x)
+        return x
+
+# ============== timm features_only 兼容包装器 ==============
+class _ForwardFeaturesWrapper(nn.Module):
+    def __init__(self, backbone: nn.Module):
+        super().__init__()
+        self.backbone = backbone
+    def forward(self, x):
+        if hasattr(self.backbone, "forward_features"):
+            y = self.backbone.forward_features(x)
+        else:
+            y = self.backbone(x)
+        return [y]
+
+# ================= EfficientNetV2S + CBAM 主体 =================
+class EfficientNetV2S_CBAM(nn.Module):
+    """
+    用法：
+      m = EfficientNetV2S_CBAM(
+          num_classes=2, in_channels=1, pretrained=False,
+          proj_dim=256, drop=0.2, backbone_name='efficientnetv2_rw_s',
+          pretrained_weights_path=r'C:\\2\\pytorch_model.bin'  # 或 .safetensors
+      )
+      feat = m(x)              # (B, proj_dim) —— 融合用
+      logits = m.classify(x)   # (B, num_classes)
+    """
+    def __init__(self,
+                 num_classes: int = 2,
+                 in_channels: int = 1,
+                 pretrained: bool = False,
+                 proj_dim: int = 256,
+                 drop: float = 0.2,
+                 freeze_stem: bool = False,
+                 backbone_name: str = 'efficientnetv2_rw_s',
+                 pretrained_weights_path: Optional[str] = None):
+        super().__init__()
+        self.num_classes = num_classes
+        self.feature_dim = proj_dim
+        self.expected_in_channels = in_channels
+        self.backbone_used = None
+        # 我们统一以 3 通道构建骨干，最兼容（预训练/结构），动态适配输入到 3C
+        self._backbone_in_chans = 3
+
+        # ====== 构建 backbone（不联网），并尝试加载本地权重 ======
+        self.backbone, last_c, self.backbone_used = self._build_backbone(
+            backbone_name=backbone_name,
+            in_chans=self._backbone_in_chans,
+            local_ckpt=pretrained_weights_path
+        )
+
+        # ====== 动态输入适配器（运行时判断通道） ======
+        self.adapter_1to3 = nn.Conv2d(1, 3, kernel_size=1, bias=False)
+        nn.init.kaiming_normal_(self.adapter_1to3.weight, mode='fan_out', nonlinearity='relu')
+
+        # ====== 头部：CBAM + GAP + 投影 + 分类 ======
+        self.cbam = CBAM(last_c, ratio=8, sa_kernel=7)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.proj = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(last_c, proj_dim),
+            nn.BatchNorm1d(proj_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=drop)
+        )
+        self.classifier = nn.Linear(proj_dim, num_classes)
+
+        if freeze_stem and hasattr(self.backbone, "named_parameters"):
+            for n, p in self.backbone.named_parameters():
+                if "stem" in n:
+                    p.requires_grad = False
+
+    # --------- 构建 backbone（离线，features_only 优先） ---------
+    def _build_backbone(
+        self,
+        backbone_name: str,
+        in_chans: int,
+        local_ckpt: Optional[str]
+    ) -> Tuple[nn.Module, int, str]:
+        used = ""
+        # A) 先试 features_only
+        try:
+            backbone = timm.create_model(
+                backbone_name,
+                pretrained=False,
+                in_chans=in_chans,
+                features_only=True,
+                out_indices=(4,)
+            )
+            last_c = backbone.feature_info.channels()[-1]
+            used = f"{backbone_name} (in_chans={in_chans}, random)"
+        except Exception:
+            # B) 兜底：forward_features 包装
+            tmp = timm.create_model(
+                backbone_name,
+                pretrained=False,
+                in_chans=in_chans,
+                num_classes=0,
+                global_pool=''
+            )
+            backbone = _ForwardFeaturesWrapper(tmp)
+            last_c = self._probe_out_channels(backbone)
+            used = f"{backbone_name} (in_chans={in_chans}, random, ff-wrapper)"
+
+        # C) 尝试加载本地权重（若提供）
+        if local_ckpt and os.path.isfile(local_ckpt):
+            msg = self._try_load_local(backbone, local_ckpt)
+            used += f" + local({os.path.basename(local_ckpt)}){msg}"
+
+        return backbone, last_c, used
+
+    @staticmethod
+    def _probe_out_channels(backbone: nn.Module) -> int:
+        backbone.eval()
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, 224, 224)
+            feat_map = backbone(dummy)[0]
+            return feat_map.shape[1]
+
+    @staticmethod
+    def _try_load_local(model: nn.Module, ckpt_path: str) -> str:
+        try:
+            ext = os.path.splitext(ckpt_path)[1].lower()
+            if ext == ".safetensors":
+                if not _HAS_SAFETENSORS:
+                    return " [local load failed: safetensors not installed]"
+                sd = _st_load_file(ckpt_path)
+            else:
+                sd = torch.load(ckpt_path, map_location='cpu')
+                if isinstance(sd, dict) and 'state_dict' in sd and isinstance(sd['state_dict'], dict):
+                    sd = sd['state_dict']
+            model.load_state_dict(sd, strict=False)
+            return " [local loaded]"
+        except Exception as e:
+            return f" [local load failed: {e}]"
+
+    # --------- 动态输入通道适配 ---------
+    def _adapt_input(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        以 3C 骨干为基准：
+          - 若输入是 3C：原样返回
+          - 若输入是 1C：用可学习 1x1 conv 做 1→3
+          - 若输入是其它通道：先均值到 1C，再 1→3
+        """
+        c = x.shape[1]
+        if c == 3:
+            return x
+        if c == 1:
+            return self.adapter_1to3(x)
+        x1 = x.mean(dim=1, keepdim=True)
+        return self.adapter_1to3(x1)
+
+    # ---------------- 前向（返回 embedding） ----------------
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        x = self._adapt_input(x)
+        feat_map = self.backbone(x)[0]
+        feat_map = self.cbam(feat_map)
+        pooled = self.pool(feat_map)
+        emb = self.proj(pooled)
+        return emb
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_features(x)
+
+    # ---------------- 分类接口（需要 logits 时调用） ----------------
+    def classify(self, x: torch.Tensor) -> torch.Tensor:
+        emb = self.forward_features(x)
+        logits = self.classifier(emb)
+        return logits

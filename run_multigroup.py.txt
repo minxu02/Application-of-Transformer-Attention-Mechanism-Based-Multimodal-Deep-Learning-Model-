@@ -1,0 +1,214 @@
+# run_multigroup.py
+# -*- coding: utf-8 -*-
+import os
+from collections import namedtuple
+
+# ===================== 内存与稳定性补丁（无需改 Onekey 源码） =====================
+# 训练期：禁 ONNX 导出 & 禁 TensorBoard add_graph（只保留标量），避免 trace 占用暴涨
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "1")  # ← 改为1，让CUDA错误立即抛出
+
+# 关闭 TensorBoard 追踪计算图（仅写标量）
+try:
+    from torch.utils.tensorboard import SummaryWriter as _SW
+    def _noop_add_graph(self, *args, **kwargs):
+        print("[Info] TensorBoard add_graph disabled during training.")
+        return
+    _SW.add_graph = _noop_add_graph
+except Exception as _e:
+    print("[Warn] Skip TB patch:", _e)
+
+# 关闭训练期 onnx.export（训练结束后单独导出）
+import torch.onnx as _onnx
+def _noop_onnx_export(*args, **kwargs):
+    print("[Info] ONNX export disabled during training.")
+    return
+_onnx.export = _noop_onnx_export
+
+# 全局保守化 DataLoader（框架内部即便写死参数，也会被覆盖为更稳配置）
+import torch
+from torch.utils.data import DataLoader as _OrigDataLoader
+class _PatchedDataLoader(_OrigDataLoader):
+    def __init__(self, *args, **kwargs):
+        # ★ 安全模式：单进程 + 超时保护
+        kwargs['num_workers'] = 0        # ← 改为0，避免多进程死锁
+        kwargs['persistent_workers'] = False
+        kwargs.pop('prefetch_factor', None)  # workers=0时不能设置
+        kwargs['pin_memory'] = False
+        kwargs['timeout'] = 0            # 单进程时设0即可
+        super().__init__(*args, **kwargs)
+
+if torch.utils.data.DataLoader is not _PatchedDataLoader:
+    torch.utils.data.DataLoader = _PatchedDataLoader
+    print("[Info] DataLoader patched: workers=0, persistent=False, pin_memory=False")
+
+# ====== 建议的基础加速与稳定设置 ======
+torch.backends.cudnn.benchmark = True
+try:
+    torch.set_float32_matmul_precision('high')
+except Exception:
+    pass
+if torch.cuda.is_available():
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+    except Exception:
+        pass
+    try:
+        torch.backends.cudnn.allow_tf32 = True
+    except Exception:
+        pass
+
+# 固定随机种子（更可复现、评估更稳）
+import random, numpy as np
+SEED = 42
+random.seed(SEED); np.random.seed(SEED)
+torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
+
+# ====== Onekey 入口 ======
+from onekey_algo.end2end.run_OnekeyNet import main as onekey_main
+
+# 你已保存好的模型文件（efficientnetv2s_cbam.py）
+from efficientnetv2s_cbam import EfficientNetV2S_CBAM
+
+# ==================== 输出数据根目录 ====================
+OUTPUT_ROOT = r"C:\Users\xumin\Desktop\9"
+os.makedirs(OUTPUT_ROOT, exist_ok=True)
+print(f"[Info] 所有输出数据将保存到: {OUTPUT_ROOT}")
+
+# ------------------ 路径/组配置（任意数量） ------------------
+# 图像组（可以是目录 / 通配符 / 单文件）
+IMAGE_GROUPS = {
+    "V" : r"C:\Users\xumin\Desktop\THY\YS\crop",
+    # "V2": r"C:\Users\xumin\Desktop\THY\CF\crop",
+    # "V3": r"...",
+}
+
+# radiomics 组（可多个 CSV）
+RADIOMICS_GROUPS = {
+    "RAD1": {
+        "feature_file": r"C:\Users\xumin\Desktop\THY\rad_features_cleaned.csv".replace(" ",""),
+        "input_dim": 1282,               # ★ 改成该 CSV 的特征列数
+        "norm": True,
+        "hidden_unit": [32,64,128,32],
+        "dropout": 0.5,
+    },
+    # "RAD2": {...}
+}
+
+# clinical 组（可多个 CSV）
+CLINICAL_GROUPS = {
+    "CLI1": {
+        "feature_file": r"C:\Users\xumin\Desktop\THY\clinical.csv",
+        "input_dim": 10,                # ★ 改成该 CSV 的特征列数
+        "norm": True,
+        "hidden_unit": [32,64,32],
+        "dropout": 0.3,
+    },
+    # "CLI2": {...}
+}
+
+# 本地预训练权重（可选，没有就设为 None）
+LOCAL_WEIGHTS = r"C:\2\pytorch_model.bin"
+if not os.path.isfile(LOCAL_WEIGHTS):
+    LOCAL_WEIGHTS = None
+
+# ------------------ 动态构建各分支 ------------------
+def build_vision_branch(img_dir: str):
+    return {
+        "data_pattern": img_dir,
+        "image_type": "2d",
+        "model_name": EfficientNetV2S_CBAM(
+            num_classes=2,
+            in_channels=1,
+            pretrained=False,                  # 离线设 False；有网+需要可 True
+            proj_dim=256,
+            drop=0.2,
+            backbone_name="efficientnetv2_rw_s",
+            pretrained_weights_path=LOCAL_WEIGHTS
+        ),
+        "encoder": "cnn",
+        "feature_dim": 256
+    }
+
+def build_rad_branch(spec: dict):
+    return {
+        "feature_file": spec["feature_file"],
+        "norm": bool(spec.get("norm", True)),
+        "input_dim": int(spec["input_dim"]),
+        "hidden_unit": list(spec.get("hidden_unit", [128,128])),
+        "dropout": float(spec.get("dropout", 0.3)),
+        "encoder": "dnn",
+    }
+
+def build_cli_branch(spec: dict):
+    return {
+        "feature_file": spec["feature_file"],
+        "norm": bool(spec.get("norm", True)),
+        "input_dim": int(spec["input_dim"]),
+        "hidden_unit": list(spec.get("hidden_unit", [128,128])),
+        "dropout": float(spec.get("dropout", 0.3)),
+        "encoder": "dnn",
+    }
+
+# -------- 汇总 input_settings：任意多组 --------
+input_settings = {}
+
+# 图像组（V/V2/V3…）
+VISION_MODELS = {}  # 记录模型对象，供 Grad-CAM 导出
+for name, img_dir in IMAGE_GROUPS.items():
+    br = build_vision_branch(img_dir)
+    input_settings[name] = br
+    VISION_MODELS[name] = br["model_name"]
+
+# radiomics 组（RAD1/RAD2…）
+for name, spec in RADIOMICS_GROUPS.items():
+    input_settings[name] = build_rad_branch(spec)
+
+# clinical 组（CLI1/CLI2…）
+for name, spec in CLINICAL_GROUPS.items():
+    input_settings[name] = build_cli_branch(spec)
+
+# ------------------ 任务设置（照旧） ------------------
+task_settings = {
+    'pCR': {'label_file': r'C:\Users\xumin\Desktop\THY\split_info/label-RND-7.csv',
+            'type': 'clf', 'num_classes': 2},
+    # 'OS': {'label_file': r'C:\Users\onekey\Desktop\onekey\task/OS.csv',
+    #        'type': 'sur', 'event_column': 'event', 'duration_column': 'duration'},
+    # 'AgeEst': {'label_file': r'C:\Users\onekey\Desktop\onekey\task\brain_age.csv',
+    #            'type': 'reg'}
+}
+
+# ------------------ 融合与训练参数 ------------------
+fusion_settings = {"hidden_unit": [16,32,16], "dropout": 0.1}
+trans_dim = 64
+
+# ★ 将训练输出（模型、日志等）保存到指定目录
+model_root = os.path.join(OUTPUT_ROOT, "checkpoints")  # ← 改到指定目录
+os.makedirs(model_root, exist_ok=True)
+
+params = dict(
+    input_settings=input_settings,
+    task_settings=task_settings,
+    fusion_settings=fusion_settings,
+    trans_dim=trans_dim,
+
+    # === 训练关键参数 ===
+    batch_size=32,            # 显存吃紧可降为 16，并考虑梯度累积
+    epochs=50,
+    init_lr=3e-4,
+    optimizer="adamw",
+    weight_decay=5e-4,
+
+    retrain=r"",
+    model_root=model_root,
+    add_date=False,
+    iters_start=0,
+    iters_verbose=1,
+
+    # ★ 暂时关闭每个epoch保存，定位是否IO问题
+    save_per_epoch=False,     # ← 改为False
+)
+
+# ------------------ 启动训练 ------------------
+Args = namedtuple("Args", params)
+onekey_main(Args(**params))
